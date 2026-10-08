@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: omer-license-server
+    runtime: node
+    plan: free
+    rootDir: .
+    buildCommand: npm ci --omit=dev --ignore-scripts
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.16.0
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: MODEL_PROVIDER
+        value: openai
+      - key: MODEL_BASE_URL
+        value: https://api.openai.com/v1
+      - key: MODEL_NAME
+        sync: false
+      - key: MODEL_API_KEY
+        sync: false
+      - key: TRANSCRIPTION_PROVIDER
+        value: deepgram
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: SPEECHMATICS_API_KEY
+        sync: false
+      - key: DAILY_ANSWER_LIMIT
+        value: 100
+      - key: DAILY_TRANSCRIPTION_LIMIT
+        value: 20
+

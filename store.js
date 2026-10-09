@@ -6,10 +6,14 @@ class HttpError extends Error { constructor(status, message) { super(message); t
 function makeStore(env, fetcher = fetch) {
   const base = new URL(env.SUPABASE_URL);
   if (base.protocol !== 'https:') throw Error('SUPABASE_URL must use HTTPS');
+  // New secret keys authenticate through apikey; only legacy JWTs belong in Bearer.
+  const serverKey = String(env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const apiHeaders = { apikey: serverKey,
+    ...(serverKey.startsWith('sb_secret_') ? {} : { authorization: 'Bearer ' + serverKey }) };
   async function call(path, options = {}) {
     const response = await fetcher(new URL(path, base), {
       ...options, redirect: 'error', signal: AbortSignal.timeout(15000),
-      headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      headers: { ...apiHeaders,
         'content-type': 'application/json', ...options.headers }
     });
     const value = await response.json().catch(() => null);
@@ -44,7 +48,7 @@ function makeStore(env, fetcher = fetch) {
     await quota('login:' + hash(email), 10, 600000);
     const response = await fetcher(new URL('/auth/v1/token?grant_type=password', base), {
       method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15000),
-      headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, 'content-type': 'application/json' },
+      headers: { apikey: serverKey, 'content-type': 'application/json' },
       body: JSON.stringify({ email, password: input.password })
     });
     const auth = await response.json();

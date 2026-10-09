@@ -3,17 +3,27 @@ const http = require('node:http');
 const ws = require('ws');
 const { makeStore, hash, secret, HttpError } = require('./store');
 const compat = require('./compat');
+function serverSettings(env) {
+  const address = String(env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || '').trim();
+  if (!address) throw Error('Missing PUBLIC_URL or Render-provided RENDER_EXTERNAL_URL');
+  const publicUrl = new URL(address);
+  if (publicUrl.protocol !== 'https:' || publicUrl.username || publicUrl.password || publicUrl.search || publicUrl.hash || publicUrl.pathname !== '/') throw Error('Public URL must be an HTTPS origin');
+  const baseUrl = new URL(String(env.MODEL_BASE_URL || 'https://api.openai.com/v1').trim());
+  if (baseUrl.protocol !== 'https:' || baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) throw Error('MODEL_BASE_URL must be an HTTPS API endpoint without credentials or query parameters');
+  let provider = env.MODEL_PROVIDER || 'openai';
+  if (baseUrl.hostname === 'generativelanguage.googleapis.com') provider = /\/openai\/?$/.test(baseUrl.pathname) ? 'openai' : 'gemini';
+  if (!['openai', 'gemini', 'anthropic'].includes(provider)) throw Error('MODEL_PROVIDER must be openai, gemini, or anthropic');
+  return { publicUrl: publicUrl.origin, config: {
+    provider, baseUrl: baseUrl.toString().replace(/\/+$/, ''),
+    apiKey: env.MODEL_API_KEY, model: env.MODEL_NAME, authMode: env.MODEL_AUTH_MODE || 'api-key'
+  } };
+}
 function createService(env, dependencies = {}) {
 const WebSocket = dependencies.WebSocket || ws.WebSocket;
 const WebSocketServer = ws.WebSocketServer;
-for (const key of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'PUBLIC_URL', 'MODEL_API_KEY', 'MODEL_NAME']) if (!env[key]) throw Error('Missing server environment: ' + key);
-if (new URL(env.PUBLIC_URL).protocol !== 'https:') throw Error('PUBLIC_URL must be HTTPS');
+for (const key of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'MODEL_API_KEY', 'MODEL_NAME']) if (!env[key]) throw Error('Missing server environment: ' + key);
+const { publicUrl, config } = serverSettings(env);
 const store = dependencies.store || makeStore(env);
-const config = {
-  provider: env.MODEL_PROVIDER || 'openai', baseUrl: env.MODEL_BASE_URL || 'https://api.openai.com/v1',
-  apiKey: env.MODEL_API_KEY, model: env.MODEL_NAME, authMode: env.MODEL_AUTH_MODE || 'api-key'
-};
-if (new URL(config.baseUrl).protocol !== 'https:') throw Error('MODEL_BASE_URL must be HTTPS');
 const dailyLimit = Number(env.DAILY_ANSWER_LIMIT || 100);
 const dailySpeech = Number(env.DAILY_TRANSCRIPTION_LIMIT || 20);
 if (![dailyLimit, dailySpeech].every(n => Number.isInteger(n) && n > 0 && n <= 10000)) throw Error('Invalid usage limits');
@@ -32,7 +42,7 @@ async function credential(user, token) {
   if (tickets.size >= 1000) throw new HttpError(503, 'Please retry later.');
   const ticket = secret();
   tickets.set(ticket, { user, token, expires: Date.now() + 30000 });
-  const relay = 'omer-relay1.' + Buffer.from(JSON.stringify({ url: env.PUBLIC_URL.replace(/^https:/, 'wss:') + '/realtime?ticket=' + ticket })).toString('base64url');
+  const relay = 'omer-relay1.' + Buffer.from(JSON.stringify({ url: publicUrl.replace(/^https:/, 'wss:') + '/realtime?ticket=' + ticket })).toString('base64url');
   return env.TRANSCRIPTION_PROVIDER === 'deepgram'
     ? 'omer-dg1.' + Buffer.from(JSON.stringify({ token: relay, model: env.DEEPGRAM_MODEL || 'nova-3' })).toString('base64url') : relay;
 }
@@ -139,7 +149,7 @@ server.requestTimeout = 70000;
 server.headersTimeout = 15000;
 return { server, close() { clearInterval(ticketCleanup); for (const entries of streams.values()) for (const entry of entries) entry.close(); server.close(); server.closeAllConnections(); } };
 }
-module.exports = { createService };
+module.exports = { createService, serverSettings };
 if (require.main === module) {
   const service = createService(process.env);
   service.server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => console.log('Omer license server ready'));

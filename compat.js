@@ -2,7 +2,7 @@
 const { randomUUID } = require('node:crypto');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const context = new AsyncLocalStorage();
-const nativeFetch = (url, options = {}) => fetch(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(60000) });
+const nativeFetch = (url, options = {}) => fetch(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(55000) });
 function readData() { return context.getStore().data; }
 function writeData(data) { context.getStore().data = data; context.getStore().dirty = true; }
 function readConfig() { return context.getStore().config; }
@@ -230,7 +230,9 @@ function libraryItemText(item) {
 }
 function sessionContext(chatBody) {
   const data = readData();
-  const sessionItem = data.sessions.find(item => item.id === chatBody.callSessionId);
+  const trigger = chatTrigger(chatBody || {});
+  const sessionId = chatBody.callSessionId || chatBody.sessionId || trigger.callSessionId || trigger.sessionId;
+  const sessionItem = data.sessions.find(item => item.id === sessionId);
   if (!sessionItem) return "";
   const metadata = sessionItem.metadata && typeof sessionItem.metadata === "object" ? sessionItem.metadata : {};
   const value = name => sessionItem[name] !== undefined ? sessionItem[name] : metadata[name];
@@ -238,16 +240,17 @@ function sessionContext(chatBody) {
   const jobLines = [
     value("title") && "Company / session: " + value("title"),
     value("companyDomain") && "Company domain: " + value("companyDomain"),
-    value("description") && "Job description: " + value("description")
+    (value("jobDescription") || value("description") || value("roleDescription")) && "Job description: " + (value("jobDescription") || value("description") || value("roleDescription"))
   ].filter(Boolean);
   if (jobLines.length) sections.push("JOB AND SESSION DETAILS\n" + jobLines.join("\n"));
 
-  const resumeId = value("resumeId");
-  const resume = resumeId ? data.resumes.find(item => itemId(item) === String(resumeId)) : null;
+  const resumeId = value("resumeId") || value("selectedResumeId");
+  const resume = resumeId ? data.resumes.find(item => itemId(item) === String(resumeId)) : (data.resumes.length === 1 ? data.resumes[0] : null);
   const resumeText = libraryItemText(resume);
   if (resumeText) sections.push("SELECTED RESUME\n" + resumeText);
 
-  const selectedIds = Array.isArray(value("selectedDocumentIds")) ? value("selectedDocumentIds").map(String) : [];
+  const selected = value("selectedDocumentIds") || value("documentIds") || value("selectedDocuments");
+  const selectedIds = Array.isArray(selected) ? selected.map(item => typeof item === "object" ? itemId(item) : String(item)) : [];
   const useAllDocuments = value("documentSelectionMode") === "all";
   const documents = useAllDocuments
     ? data.documents
@@ -274,7 +277,7 @@ function sessionContext(chatBody) {
 }
 function systemPrompt(chatBody) {
   const context = sessionContext(chatBody || {});
-  const base = "You are a concise real-time interview and meeting assistant. Answer the user's question directly and accurately. Follow the user's instructions and answer preferences. Use the supplied resume, documents, and job details when relevant; do not invent missing facts.";
+  const base = "You are a concise real-time interview and meeting assistant. Answer the current spoken, typed, or on-screen question directly and accurately. Ground personal-experience answers in the supplied resume, tailor role answers to the job description, and use selected documents when relevant. If the question is outside those materials, answer it from reliable general knowledge. Never invent the user's personal experience, employers, skills, or achievements.";
   return context ? base + "\n\nSESSION CONTEXT\n" + context : base;
 }
 function screenshotAttachments(chatBody) {
@@ -340,11 +343,24 @@ function apiError(parsed, status, fallback) {
   return parsed && parsed.error && (parsed.error.message || parsed.error.type) || parsed && parsed.message || fallback + " (" + status + ").";
 }
 async function fetchJson(url, options, fallback) {
-  const response = await nativeFetch(url, options);
-  const raw = await response.text();
-  let parsed = {}; try { parsed = JSON.parse(raw); } catch (_) {}
-  if (!response.ok) throw new Error(apiError(parsed, response.status, fallback));
-  return parsed;
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await nativeFetch(url, options);
+      const raw = await response.text();
+      let parsed = {}; try { parsed = JSON.parse(raw); } catch (_) {}
+      if (!response.ok) {
+        const error = Object.assign(new Error(apiError(parsed, response.status, fallback)), { status: response.status });
+        if (![408, 409, 425, 429, 500, 502, 503, 504].includes(response.status)) throw error;
+        lastError = error;
+      } else return parsed;
+    } catch (error) {
+      lastError = error;
+      if (error.status && ![408, 409, 425, 429, 500, 502, 503, 504].includes(error.status)) throw error;
+    }
+    if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  throw Object.assign(new Error(lastError?.message || fallback + ". Please retry."), { status: lastError?.status || 503 });
 }
 async function requestCompletion(payloadConfig, chatBody) {
   if (!nativeFetch) throw new Error("Fetch is unavailable in this Electron version.");
@@ -402,16 +418,28 @@ async function requestCompletion(payloadConfig, chatBody) {
   }, "OpenAI-compatible request failed");
   return parsed.choices && parsed.choices[0] && parsed.choices[0].message && parsed.choices[0].message.content || "";
 }
-function writeSse(response, content) {
-  response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive", "access-control-allow-origin": "*", "x-vercel-ai-ui-message-stream": "v1" });
+function startSse(response) {
+  response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", connection: "keep-alive", "access-control-allow-origin": "*", "x-accel-buffering": "no", "x-vercel-ai-ui-message-stream": "v1" });
   const id = randomUUID();
+  [{ type: "start", messageId: id }, { type: "start-step" }, { type: "text-start", id: "text-1" }]
+    .forEach(chunk => response.write("data: " + JSON.stringify(chunk) + "\n\n"));
+  return id;
+}
+function writeSse(response, content, id) {
+  id ||= startSse(response);
   const chunks = [
-    { type: "start", messageId: id }, { type: "start-step" }, { type: "text-start", id: "text-1" },
     { type: "text-delta", id: "text-1", delta: content }, { type: "text-end", id: "text-1" },
     { type: "finish-step" }, { type: "finish", finishReason: "stop" }
   ];
   chunks.forEach(chunk => response.write("data: " + JSON.stringify(chunk) + "\n\n"));
   response.end("data: [DONE]\n\n");
 }
+function writeSseError(response, error, id) {
+  id ||= startSse(response);
+  const message = error?.message || "The answer service did not respond. Please retry.";
+  [{ type: "error", errorText: message }, { type: "text-end", id: "text-1" }, { type: "finish-step" }, { type: "finish", finishReason: "error" }]
+    .forEach(chunk => response.write("data: " + JSON.stringify(chunk) + "\n\n"));
+  response.end("data: [DONE]\n\n");
+}
 
-module.exports = { context, getInput, handleProcedure, superjson, requestCompletion, writeSse };
+module.exports = { context, getInput, handleProcedure, superjson, requestCompletion, startSse, writeSse, writeSseError, promptFromChat, sessionContext, systemPrompt };

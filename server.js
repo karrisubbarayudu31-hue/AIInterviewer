@@ -77,9 +77,17 @@ const server = http.createServer(async (req, res) => {
         let answer;
         if (url.pathname === '/api/chat' && req.method === 'POST') {
           await store.quota('answers:' + user.id, dailyLimit, 86400000);
-          answer = await compat.requestCompletion(null, await body(req));
-          await store.authorize(token);
-          return compat.writeSse(res, answer);
+          const input = await body(req);
+          const streamId = compat.startSse(res);
+          const keepAlive = setInterval(() => { if (!res.writableEnded) res.write(': waiting\n\n'); }, 10000);
+          keepAlive.unref();
+          try {
+            answer = await compat.requestCompletion(null, input);
+            await store.authorize(token);
+            return compat.writeSse(res, answer, streamId);
+          } catch (error) {
+            return compat.writeSseError(res, error, streamId);
+          } finally { clearInterval(keepAlive); }
         }
         if (url.pathname === '/library/import' && req.method === 'POST') {
           const input = await body(req);
@@ -145,7 +153,7 @@ server.on('upgrade', async (req, socket, head) => {
     } catch (e) { release(); throw e; }
   } catch { upstream?.terminate(); socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); }
 });
-server.requestTimeout = 70000;
+server.requestTimeout = 130000;
 server.headersTimeout = 15000;
 return { server, close() { clearInterval(ticketCleanup); for (const entries of streams.values()) for (const entry of entries) entry.close(); server.close(); server.closeAllConnections(); } };
 }

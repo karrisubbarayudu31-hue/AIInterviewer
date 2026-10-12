@@ -130,8 +130,10 @@ async function handleProcedure(name, input) {
       data.sessions.unshift(item); writeData(data); return item;
     }
     case "callSession.delete": {
-      const index = data.sessions.findIndex(item => item.id === (input.callSessionId || input.id));
+      const sessionId = input.callSessionId || input.id;
+      const index = data.sessions.findIndex(item => item.id === sessionId);
       if (index >= 0) data.sessions.splice(index, 1);
+      if (data.conversations) delete data.conversations[sessionId];
       writeData(data);
       return true;
     }
@@ -205,6 +207,33 @@ function promptFromChat(body) {
   const rows = body.pendingTranscriptEntries || [];
   const text = rows.map(row => row.transcript || row.text || row.content || "").filter(Boolean).join("\n");
   return text || "Give concise, useful help for the current session.";
+}
+function chatSessionId(body) {
+  const trigger = chatTrigger(body || {});
+  return String(body?.callSessionId || body?.sessionId || trigger.callSessionId || trigger.sessionId || "").trim();
+}
+function conversationHistory(chatBody, limit = 8) {
+  const data = readData();
+  const sessionId = chatSessionId(chatBody);
+  if (!sessionId || !data.conversations || !Array.isArray(data.conversations[sessionId])) return [];
+  return data.conversations[sessionId]
+    .filter(turn => turn && ["user", "assistant"].includes(turn.role) && typeof turn.content === "string" && turn.content.trim())
+    .slice(-limit)
+    .map(turn => ({ role: turn.role, content: turn.content.slice(0, 8000) }));
+}
+function rememberConversation(chatBody, question, answer) {
+  const data = readData();
+  const sessionId = chatSessionId(chatBody);
+  if (!sessionId || !question || !answer) return false;
+  data.conversations ||= {};
+  const turns = Array.isArray(data.conversations[sessionId]) ? data.conversations[sessionId] : [];
+  turns.push(
+    { role: "user", content: String(question).slice(0, 8000), createdAt: new Date().toISOString() },
+    { role: "assistant", content: String(answer).slice(0, 12000), createdAt: new Date().toISOString() }
+  );
+  data.conversations[sessionId] = turns.slice(-12);
+  writeData(data);
+  return true;
 }
 function firstText(source, names) {
   if (!source || typeof source !== "object") return "";
@@ -308,7 +337,7 @@ function answerStyleInstructions(chatBody) {
 function systemPrompt(chatBody) {
   const context = sessionContext(chatBody || {});
   const style = answerStyleInstructions(chatBody || {});
-  const base = "You are a real-time interview and meeting assistant. Answer the current spoken, typed, or on-screen question directly and accurately. Ground personal-experience answers in the supplied resume, tailor role answers to the job description, and use selected documents when relevant. If the question is outside those materials, answer it from reliable general knowledge. Never invent the user's personal experience, employers, skills, or achievements. Follow the requested answer style even when it requires a longer response.";
+  const base = "You are a real-time interview and meeting assistant. Answer the current spoken, typed, or on-screen question directly and accurately. Treat recent question-and-answer turns as one continuous conversation: resolve pronouns and follow-up phrases from that history, preserve relevant facts, and do not repeat earlier material unless it helps answer the new question. Ground personal-experience answers in the supplied resume, tailor role answers to the job description, and use selected documents when relevant. If the question is outside those materials, answer it from reliable general knowledge. Never invent the user's personal experience, employers, skills, or achievements. Follow the requested answer style even when it requires a longer response.";
   return base + "\n\nANSWER STYLE\n" + style + (context ? "\n\nSESSION CONTEXT\n" + context : "");
 }
 function screenshotAttachments(chatBody) {
@@ -403,6 +432,7 @@ async function requestCompletion(payloadConfig, chatBody) {
     prompt = "Analyze the attached screenshot and answer the visible question or provide the requested help.\n\n" + prompt;
   }
   const system = systemPrompt(chatBody || {});
+  const history = conversationHistory(chatBody || {});
   if (config.provider === "anthropic") {
     const content = [
       ...screenshots.map(item => ({ type: "image", source: { type: "base64", media_type: item.mediaType, data: item.data } })),
@@ -415,7 +445,7 @@ async function requestCompletion(payloadConfig, chatBody) {
         model: config.model,
         max_tokens: 2048,
         system,
-        messages: [{ role: "user", content }]
+        messages: [...history, { role: "user", content }]
       })
     }, "Anthropic request failed");
     return Array.isArray(parsed.content) ? parsed.content.filter(item => item && item.type === "text").map(item => item.text).join("") : "";
@@ -428,7 +458,10 @@ async function requestCompletion(payloadConfig, chatBody) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system }] },
-        contents: [{ role: "user", parts: [...documentParts, ...screenshots.map(item => ({ inlineData: { mimeType: item.mediaType, data: item.data } })), { text: prompt }] }]
+        contents: [
+          ...history.map(turn => ({ role: turn.role === "assistant" ? "model" : "user", parts: [{ text: turn.content }] })),
+          { role: "user", parts: [...documentParts, ...screenshots.map(item => ({ inlineData: { mimeType: item.mediaType, data: item.data } })), { text: prompt }] }
+        ]
       })
     }, "Gemini request failed");
     return (parsed.candidates || []).flatMap(item => item && item.content && item.content.parts || []).map(item => item.text || "").join("");
@@ -440,6 +473,7 @@ async function requestCompletion(payloadConfig, chatBody) {
       model: config.model,
       messages: [
         { role: "system", content: system },
+        ...history,
         { role: "user", content: screenshots.length ? [
           { type: "text", text: prompt },
           ...screenshots.map(item => ({ type: "image_url", image_url: { url: item.dataUrl } }))
@@ -448,6 +482,88 @@ async function requestCompletion(payloadConfig, chatBody) {
     })
   }, "OpenAI-compatible request failed");
   return parsed.choices && parsed.choices[0] && parsed.choices[0].message && parsed.choices[0].message.content || "";
+}
+async function requestCompletionStream(payloadConfig, chatBody, onDelta) {
+  if (!nativeFetch) throw new Error("Fetch is unavailable in this Electron version.");
+  const config = payloadConfig || readConfig();
+  if (!config.apiKey) throw new Error("Open API settings and save your API key first.");
+  const screenshots = screenshotAttachments(chatBody || {});
+  let prompt = promptFromChat(chatBody || {});
+  if (screenshots.length && chatTrigger(chatBody).kind === "analyze-screen") {
+    prompt = "Analyze the attached screenshot and answer the visible question or provide the requested help.\n\n" + prompt;
+  }
+  const system = systemPrompt(chatBody || {});
+  const history = conversationHistory(chatBody || {});
+  let url;
+  let options;
+  let provider = config.provider;
+  if (provider === "anthropic") {
+    const content = [
+      ...screenshots.map(item => ({ type: "image", source: { type: "base64", media_type: item.mediaType, data: item.data } })),
+      { type: "text", text: prompt }
+    ];
+    url = config.baseUrl + "/messages";
+    options = { method: "POST", headers: { "content-type": "application/json", ...providerHeaders(config) }, body: JSON.stringify({ model: config.model, max_tokens: 2048, stream: true, system, messages: [...history, { role: "user", content }] }) };
+  } else if (provider === "gemini") {
+    const model = String(config.model).replace(/^models\//, "");
+    const documentParts = geminiDocumentParts(chatBody || {});
+    url = geminiGenerateUrl(config.baseUrl, model, config.apiKey).replace(":generateContent?", ":streamGenerateContent?alt=sse&");
+    options = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [...history.map(turn => ({ role: turn.role === "assistant" ? "model" : "user", parts: [{ text: turn.content }] })), { role: "user", parts: [...documentParts, ...screenshots.map(item => ({ inlineData: { mimeType: item.mediaType, data: item.data } })), { text: prompt }] }]
+    }) };
+  } else {
+    provider = "openai";
+    url = config.baseUrl + "/chat/completions";
+    options = { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + config.apiKey }, body: JSON.stringify({ model: config.model, stream: true, messages: [
+      { role: "system", content: system }, ...history,
+      { role: "user", content: screenshots.length ? [{ type: "text", text: prompt }, ...screenshots.map(item => ({ type: "image_url", image_url: { url: item.dataUrl } }))] : prompt }
+    ] }) };
+  }
+  let response;
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      response = await nativeFetch(url, options);
+      if (response.ok) break;
+      const raw = await response.text();
+      let parsed = {}; try { parsed = JSON.parse(raw); } catch (_) {}
+      lastError = Object.assign(new Error(apiError(parsed, response.status, "Model request failed")), { status: response.status });
+      if (![408, 409, 425, 429, 500, 502, 503, 504].includes(response.status)) throw lastError;
+    } catch (error) {
+      lastError = error;
+      if (error.status && ![408, 409, 425, 429, 500, 502, 503, 504].includes(error.status)) throw error;
+    }
+    if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 300));
+  }
+  if (!response?.ok) throw Object.assign(new Error(lastError?.message || "Model request failed. Please retry."), { status: lastError?.status || 503 });
+  if (!response.body) throw new Error("The model returned an empty response.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+  const accept = raw => {
+    const value = raw.trim();
+    if (!value || value === "[DONE]") return;
+    let event; try { event = JSON.parse(value); } catch (_) { return; }
+    const delta = provider === "anthropic"
+      ? event?.delta?.text || ""
+      : provider === "gemini"
+        ? (event?.candidates || []).flatMap(item => item?.content?.parts || []).map(item => item.text || "").join("")
+        : event?.choices?.[0]?.delta?.content || "";
+    if (delta) { answer += delta; onDelta(delta); }
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split(/\r?\n/);
+    buffer = done ? "" : lines.pop();
+    for (const line of lines) if (line.startsWith("data:")) accept(line.slice(5));
+    if (done) break;
+  }
+  if (buffer.startsWith("data:")) accept(buffer.slice(5));
+  if (!answer.trim()) throw new Error("The model returned an empty response.");
+  return answer;
 }
 function startSse(response) {
   response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", connection: "keep-alive", "access-control-allow-origin": "*", "x-accel-buffering": "no", "x-vercel-ai-ui-message-stream": "v1" });
@@ -458,9 +574,16 @@ function startSse(response) {
 }
 function writeSse(response, content, id) {
   id ||= startSse(response);
+  const chunks = [{ type: "text-delta", id: "text-1", delta: content }];
+  chunks.forEach(chunk => response.write("data: " + JSON.stringify(chunk) + "\n\n"));
+  finishSse(response, id);
+}
+function writeSseDelta(response, content) {
+  if (content && !response.writableEnded) response.write("data: " + JSON.stringify({ type: "text-delta", id: "text-1", delta: content }) + "\n\n");
+}
+function finishSse(response) {
   const chunks = [
-    { type: "text-delta", id: "text-1", delta: content }, { type: "text-end", id: "text-1" },
-    { type: "finish-step" }, { type: "finish", finishReason: "stop" }
+    { type: "text-end", id: "text-1" }, { type: "finish-step" }, { type: "finish", finishReason: "stop" }
   ];
   chunks.forEach(chunk => response.write("data: " + JSON.stringify(chunk) + "\n\n"));
   response.end("data: [DONE]\n\n");
@@ -473,4 +596,4 @@ function writeSseError(response, error, id) {
   response.end("data: [DONE]\n\n");
 }
 
-module.exports = { context, getInput, handleProcedure, superjson, requestCompletion, startSse, writeSse, writeSseError, promptFromChat, sessionContext, answerStyleInstructions, systemPrompt };
+module.exports = { context, getInput, handleProcedure, superjson, requestCompletion, requestCompletionStream, startSse, writeSse, writeSseDelta, finishSse, writeSseError, promptFromChat, chatSessionId, conversationHistory, rememberConversation, sessionContext, answerStyleInstructions, systemPrompt };

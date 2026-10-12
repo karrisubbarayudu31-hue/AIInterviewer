@@ -82,9 +82,12 @@ const server = http.createServer(async (req, res) => {
           const keepAlive = setInterval(() => { if (!res.writableEnded) res.write(': waiting\n\n'); }, 10000);
           keepAlive.unref();
           try {
-            answer = await compat.requestCompletion(null, input);
+            const question = compat.promptFromChat(input);
+            answer = await compat.requestCompletionStream(null, input, delta => compat.writeSseDelta(res, delta));
+            compat.rememberConversation(input, question, answer);
             await store.authorize(token);
-            return compat.writeSse(res, answer, streamId);
+            if (state.dirty) await store.save(user.id, record.version, state.data);
+            return compat.finishSse(res, streamId);
           } catch (error) {
             return compat.writeSseError(res, error, streamId);
           } finally { clearInterval(keepAlive); }

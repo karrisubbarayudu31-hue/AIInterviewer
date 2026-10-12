@@ -275,10 +275,41 @@ function sessionContext(chatBody) {
   if (preferences.length) sections.push("ANSWER PREFERENCES\n" + preferences.join("\n"));
   return sections.join("\n\n");
 }
+function answerStyleInstructions(chatBody) {
+  const data = readData();
+  const trigger = chatTrigger(chatBody || {});
+  const sessionId = chatBody.callSessionId || chatBody.sessionId || trigger.callSessionId || trigger.sessionId;
+  const sessionItem = data.sessions.find(item => item.id === sessionId) || {};
+  const metadata = sessionItem.metadata && typeof sessionItem.metadata === "object" ? sessionItem.metadata : {};
+  const value = (name, fallback) => sessionItem[name] !== undefined ? sessionItem[name] : metadata[name] !== undefined ? metadata[name] : fallback;
+  const length = value("responseLength", "balanced");
+  const format = value("responseFormat", "balanced");
+  const tone = value("responseTone", "simple");
+  const rules = [
+    length === "concise"
+      ? "Length: concise, normally 50-90 words unless the question requires code or a list."
+      : length === "detailed"
+        ? "Length: detailed, normally 250-400 words with explanation, examples, and supporting detail."
+        : "Length: balanced, normally 140-220 words with enough context to answer confidently.",
+    format === "paragraph"
+      ? "Format: a complete natural spoken script in paragraphs, with no bullet list unless the question explicitly asks for one."
+      : format === "bullets"
+        ? "Format: short, clear bullet points that the user can express in their own words."
+        : "Format: begin with a natural spoken answer, then add concise supporting bullet points.",
+    tone === "formal"
+      ? "Tone: precise and professional."
+      : "Tone: simple, conversational language without unnecessary jargon."
+  ];
+  if (value("useStarMethod", false)) rules.push("For behavioral or experience questions, explicitly structure the answer as Situation, Task, Action, and Result.");
+  if (value("useFillerWords", false) && format !== "bullets") rules.push("Use a few natural spoken transitions such as 'well' or 'for example', without overusing them.");
+  rules.push("Infer the current question type from the question itself and adapt the content: behavioral, coding, experience, how-to, situational, system design, technical knowledge, or introduction.");
+  return rules.join("\n");
+}
 function systemPrompt(chatBody) {
   const context = sessionContext(chatBody || {});
-  const base = "You are a concise real-time interview and meeting assistant. Answer the current spoken, typed, or on-screen question directly and accurately. Ground personal-experience answers in the supplied resume, tailor role answers to the job description, and use selected documents when relevant. If the question is outside those materials, answer it from reliable general knowledge. Never invent the user's personal experience, employers, skills, or achievements.";
-  return context ? base + "\n\nSESSION CONTEXT\n" + context : base;
+  const style = answerStyleInstructions(chatBody || {});
+  const base = "You are a real-time interview and meeting assistant. Answer the current spoken, typed, or on-screen question directly and accurately. Ground personal-experience answers in the supplied resume, tailor role answers to the job description, and use selected documents when relevant. If the question is outside those materials, answer it from reliable general knowledge. Never invent the user's personal experience, employers, skills, or achievements. Follow the requested answer style even when it requires a longer response.";
+  return base + "\n\nANSWER STYLE\n" + style + (context ? "\n\nSESSION CONTEXT\n" + context : "");
 }
 function screenshotAttachments(chatBody) {
   const body = chatBody || {};
@@ -442,4 +473,4 @@ function writeSseError(response, error, id) {
   response.end("data: [DONE]\n\n");
 }
 
-module.exports = { context, getInput, handleProcedure, superjson, requestCompletion, startSse, writeSse, writeSseError, promptFromChat, sessionContext, systemPrompt };
+module.exports = { context, getInput, handleProcedure, superjson, requestCompletion, startSse, writeSse, writeSseError, promptFromChat, sessionContext, answerStyleInstructions, systemPrompt };

@@ -41,7 +41,7 @@ async function credential(user, token) {
   await store.quota('speech:' + user.id, dailySpeech, 86400000);
   if (tickets.size >= 1000) throw new HttpError(503, 'Please retry later.');
   const ticket = secret();
-  tickets.set(ticket, { user, token, expires: Date.now() + 30000 });
+  tickets.set(ticket, { user, token, expires: Date.now() + 90000 });
   const relay = 'omer-relay1.' + Buffer.from(JSON.stringify({ url: publicUrl.replace(/^https:/, 'wss:') + '/realtime?ticket=' + ticket })).toString('base64url');
   return env.TRANSCRIPTION_PROVIDER === 'deepgram'
     ? 'omer-dg1.' + Buffer.from(JSON.stringify({ token: relay, model: env.DEEPGRAM_MODEL || 'nova-3' })).toString('base64url') : relay;
@@ -124,6 +124,7 @@ const server = http.createServer(async (req, res) => {
 const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024, perMessageDeflate: false });
 server.on('upgrade', async (req, socket, head) => {
   let upstream;
+  let release = () => {};
   try {
     const url = new URL(req.url, 'http://server');
     const ticket = url.searchParams.get('ticket');
@@ -134,27 +135,65 @@ server.on('upgrade', async (req, socket, head) => {
     if (active.size >= 2) throw Error('Too many streams');
     streams.set(user.id, active);
     const entry = { close: () => upstream?.terminate() }; active.add(entry);
-    const release = () => { active.delete(entry); if (!active.size) streams.delete(user.id); };
-    try {
-      if (env.TRANSCRIPTION_PROVIDER === 'deepgram') {
-        const q = new URLSearchParams({ model: env.DEEPGRAM_MODEL || 'nova-3', encoding: 'linear16', sample_rate: '16000', channels: '1', interim_results: 'true', punctuate: 'true', smart_format: 'true', diarize: 'true', endpointing: '300' });
-        upstream = new WebSocket('wss://api.deepgram.com/v1/listen?' + q, { headers: { Authorization: 'Token ' + env.DEEPGRAM_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
-      } else upstream = new WebSocket('wss://eu.rt.speechmatics.com/v2', { headers: { Authorization: 'Bearer ' + env.SPEECHMATICS_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
-      await new Promise((resolve, reject) => { upstream.once('open', resolve); upstream.once('error', reject); });
-      await store.authorize(item.token);
-      wss.handleUpgrade(req, socket, head, downstream => {
-        let closed = false;
-        const close = () => { if (closed) return; closed = true; clearInterval(check); clearTimeout(maxDuration); downstream.close(1008, 'Session ended'); upstream.terminate(); release(); };
-        entry.close = close;
-        let checking = false;
-        const check = setInterval(async () => { if (checking) return; checking = true; try { await store.authorize(item.token); } catch { close(); } finally { checking = false; } }, dependencies.checkInterval || 15000);
-        const maxDuration = setTimeout(close, 60 * 60000);
-        downstream.on('message', (data, binary) => { if (upstream.bufferedAmount > 2 * 1024 * 1024) return close(); if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary }); });
-        upstream.on('message', (data, binary) => { if (downstream.bufferedAmount > 2 * 1024 * 1024) return close(); if (downstream.readyState === WebSocket.OPEN) downstream.send(data, { binary }); });
-        downstream.on('close', close); downstream.on('error', close); upstream.on('close', close); upstream.on('error', close);
+    release = () => { active.delete(entry); if (!active.size) streams.delete(user.id); };
+    if (env.TRANSCRIPTION_PROVIDER === 'deepgram') {
+      const language = String(env.DEEPGRAM_LANGUAGE || 'en-IN');
+      if (!/^[a-z]{2,3}(?:-[A-Z]{2})?$|^multi$/.test(language)) throw Error('Invalid Deepgram language');
+      const q = new URLSearchParams({
+        model: env.DEEPGRAM_MODEL || 'nova-3', language, encoding: 'linear16', sample_rate: '16000', channels: '1',
+        interim_results: 'true', punctuate: 'true', smart_format: 'true', numerals: 'true', diarize: 'true',
+        endpointing: '300', utterance_end_ms: '800', vad_events: 'true', mip_opt_out: 'true'
       });
-    } catch (e) { release(); throw e; }
-  } catch { upstream?.terminate(); socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); }
+      upstream = new WebSocket('wss://api.deepgram.com/v1/listen?' + q, { headers: { Authorization: 'Token ' + env.DEEPGRAM_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
+    } else upstream = new WebSocket('wss://eu.rt.speechmatics.com/v2', { headers: { Authorization: 'Bearer ' + env.SPEECHMATICS_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
+    wss.handleUpgrade(req, socket, head, downstream => {
+      let closed = false;
+      let checking = false;
+      let pending = [];
+      let pendingBytes = 0;
+      const check = setInterval(async () => { if (checking) return; checking = true; try { await store.authorize(item.token); } catch { close(1008, 'Session ended'); } finally { checking = false; } }, dependencies.checkInterval || 15000);
+      const maxDuration = setTimeout(() => close(1008, 'Session ended'), 60 * 60000);
+      const connectTimeout = setTimeout(() => close(1013, 'Transcription provider timed out'), 16000);
+      function close(code = 1000, reason = 'Session ended') {
+        if (closed) return;
+        closed = true; clearInterval(check); clearTimeout(maxDuration); clearTimeout(connectTimeout);
+        pending = []; pendingBytes = 0;
+        if (downstream.readyState < 2) downstream.close(code, reason);
+        if (upstream?.readyState < 2) upstream.terminate();
+        release();
+      }
+      entry.close = () => close(1008, 'Session ended');
+      downstream.on('message', (data, binary) => {
+        if (upstream.readyState === WebSocket.OPEN) {
+          if (upstream.bufferedAmount > 2 * 1024 * 1024) return close(1013, 'Transcription provider is busy');
+          upstream.send(data, { binary });
+        } else {
+          pendingBytes += data.length || data.byteLength || 0;
+          if (pendingBytes > 2 * 1024 * 1024) return close(1009, 'Audio buffer exceeded');
+          pending.push({ data, binary });
+        }
+      });
+      let providerReady = false;
+      const onUpstreamOpen = async () => {
+        if (providerReady || closed) return;
+        providerReady = true;
+        try {
+          await store.authorize(item.token);
+          clearTimeout(connectTimeout);
+          for (const message of pending) upstream.send(message.data, { binary: message.binary });
+          pending = []; pendingBytes = 0;
+        } catch { close(1008, 'Session ended'); }
+      };
+      upstream.once('open', onUpstreamOpen);
+      if (upstream.readyState === WebSocket.OPEN) queueMicrotask(onUpstreamOpen);
+      upstream.on('message', (data, binary) => {
+        if (downstream.bufferedAmount > 2 * 1024 * 1024) return close(1013, 'Application is not receiving transcription');
+        if (downstream.readyState === WebSocket.OPEN) downstream.send(data, { binary });
+      });
+      downstream.on('close', () => close()); downstream.on('error', () => close(1011, 'Application connection failed'));
+      upstream.on('close', () => close(1011, 'Transcription provider disconnected')); upstream.on('error', () => close(1011, 'Transcription provider failed'));
+    });
+  } catch { upstream?.terminate(); release(); if (!socket.destroyed) socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); }
 });
 server.requestTimeout = 130000;
 server.headersTimeout = 15000;

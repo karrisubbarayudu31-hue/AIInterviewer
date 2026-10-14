@@ -162,7 +162,7 @@ server.on('upgrade', async (req, socket, head) => {
         endpointing: '300', utterance_end_ms: '800', vad_events: 'true', mip_opt_out: 'true'
       });
       upstream = new WebSocket('wss://api.deepgram.com/v1/listen?' + q, { headers: { Authorization: 'Token ' + env.DEEPGRAM_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
-    } else upstream = new WebSocket('wss://eu.rt.speechmatics.com/v2', { headers: { Authorization: 'Bearer ' + env.SPEECHMATICS_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
+    } else upstream = new WebSocket('wss://global.rt.speechmatics.com/v2', { headers: { Authorization: 'Bearer ' + env.SPEECHMATICS_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
     wss.handleUpgrade(req, socket, head, downstream => {
       let closed = false;
       let checking = false;
@@ -208,7 +208,18 @@ server.on('upgrade', async (req, socket, head) => {
         if (downstream.readyState === WebSocket.OPEN) downstream.send(data, { binary });
       });
       downstream.on('close', () => close()); downstream.on('error', () => close(1011, 'Application connection failed'));
-      upstream.on('close', () => close(1011, 'Transcription provider disconnected')); upstream.on('error', () => close(1011, 'Transcription provider failed'));
+      upstream.on('unexpected-response', (_request, response) => {
+        console.error('Transcription provider rejected the connection:', response.statusCode || 'unknown status');
+        close(1011, 'Transcription provider rejected the connection');
+      });
+      upstream.on('close', (code, reason) => {
+        if (!closed && code !== 1000) console.error('Transcription provider disconnected:', code || 'unknown code', String(reason || '').slice(0, 160));
+        close(1011, 'Transcription provider disconnected');
+      });
+      upstream.on('error', error => {
+        console.error('Transcription provider WebSocket error:', String(error && (error.code || error.message) || 'unknown error').slice(0, 160));
+        close(1011, 'Transcription provider failed');
+      });
     });
   } catch { upstream?.terminate(); release(); if (!socket.destroyed) socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); }
 });

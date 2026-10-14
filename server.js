@@ -38,7 +38,6 @@ async function body(req, limit = 6 * 1024 * 1024) {
 }
 const bearer = req => /^Bearer ([\w-]+)$/.exec(req.headers.authorization || '')?.[1];
 async function credential(user, token) {
-  await store.quota('speech:' + user.id, dailySpeech, 86400000);
   if (tickets.size >= 1000) throw new HttpError(503, 'Please retry later.');
   const ticket = secret();
   tickets.set(ticket, { user, token, expires: Date.now() + 90000 });
@@ -108,7 +107,21 @@ const server = http.createServer(async (req, res) => {
           if (names.length > 30) throw new HttpError(400, 'Too many operations.');
           const inputs = req.method === 'GET' ? JSON.parse(url.searchParams.get('input') || '{}') : await body(req);
           const values = [];
-          for (let index = 0; index < names.length; index++) values.push({ result: { data: compat.superjson(await compat.handleProcedure(names[index], compat.getInput(inputs, index))) } });
+          for (let index = 0; index < names.length; index++) {
+            try {
+              values.push({ result: { data: compat.superjson(await compat.handleProcedure(names[index], compat.getInput(inputs, index))) } });
+            } catch (error) {
+              // A tRPC batch must always contain one result per requested
+              // operation. Returning a single top-level error makes the desktop
+              // client fail before it can display the real server message.
+              if (url.searchParams.get('batch') !== '1' && names.length === 1) throw error;
+              values.push({ error: compat.superjson({
+                message: error.status ? error.message : 'Server request failed.',
+                code: -32603,
+                data: { httpStatus: error.status || 500, path: names[index] }
+              }) });
+            }
+          }
           answer = url.searchParams.get('batch') === '1' || names.length > 1 ? values : values[0];
         } else throw new HttpError(404, 'Route not found.');
         await store.authorize(token);
@@ -131,6 +144,10 @@ server.on('upgrade', async (req, socket, head) => {
     const item = tickets.get(ticket); tickets.delete(ticket);
     if (url.pathname !== '/realtime' || !item || item.expires <= Date.now()) throw Error('Invalid ticket');
     const user = await store.authorize(item.token);
+    // Count transcription usage only when a relay ticket is actually used.
+    // Minting keys can be retried or batched by the desktop application and
+    // must not consume the daily allowance by itself.
+    await store.quota('speech:' + user.id, dailySpeech, 86400000);
     const active = streams.get(user.id) || new Set();
     if (active.size >= 2) throw Error('Too many streams');
     streams.set(user.id, active);

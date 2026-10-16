@@ -59,24 +59,29 @@ const server = http.createServer(async (req, res) => {
     }
     const token = bearer(req);
     const user = await store.authorize(token);
-    await store.quota('requests:' + user.id, 600, 60000);
+    const isChat = url.pathname === '/api/chat' && req.method === 'POST';
+    if (!isChat) await store.quota('requests:' + user.id, 600, 60000);
     if (url.pathname === '/auth/status' && req.method === 'GET') return json(res, 200, { email: user.email, expiresAt: user.expiresAt });
     if (url.pathname === '/auth/logout' && req.method === 'POST') {
       await store.call('/rest/v1/omer_sessions?token_hash=eq.' + hash(token), { method: 'DELETE' });
       for (const entry of streams.get(user.id) || []) entry.close();
       return json(res, 200, { ok: true });
     }
-    const isChat = url.pathname === '/api/chat';
     if (isChat && inFlight.has(user.id)) throw new HttpError(409, 'Another answer is running. Please retry.');
     if (isChat) inFlight.add(user.id);
     try {
-      const record = await store.load(user.id);
+      // These independent operations used to add three database round trips
+      // before model generation. Keep all checks, but overlap their latency.
+      const [record, chatInput] = isChat ? await Promise.all([
+        store.load(user.id), body(req),
+        store.quota('requests:' + user.id, 600, 60000),
+        store.quota('answers:' + user.id, dailyLimit, 86400000)
+      ]) : [await store.load(user.id), null];
       const state = { data: record.payload, dirty: false, user, config, dailyLimit, credential: () => credential(user, token) };
       await compat.context.run(state, async () => {
         let answer;
         if (url.pathname === '/api/chat' && req.method === 'POST') {
-          await store.quota('answers:' + user.id, dailyLimit, 86400000);
-          const input = await body(req);
+          const input = chatInput;
           const streamId = compat.startSse(res);
           const keepAlive = setInterval(() => { if (!res.writableEnded) res.write(': waiting\n\n'); }, 10000);
           keepAlive.unref();
@@ -168,6 +173,7 @@ server.on('upgrade', async (req, socket, head) => {
       let checking = false;
       let pending = [];
       let pendingBytes = 0;
+      let forwarding = false;
       const check = setInterval(async () => { if (checking) return; checking = true; try { await store.authorize(item.token); } catch { close(1008, 'Session ended'); } finally { checking = false; } }, dependencies.checkInterval || 15000);
       const maxDuration = setTimeout(() => close(1008, 'Session ended'), 60 * 60000);
       const connectTimeout = setTimeout(() => close(1013, 'Transcription provider timed out'), 16000);
@@ -181,7 +187,7 @@ server.on('upgrade', async (req, socket, head) => {
       }
       entry.close = () => close(1008, 'Session ended');
       downstream.on('message', (data, binary) => {
-        if (upstream.readyState === WebSocket.OPEN) {
+        if (forwarding && upstream.readyState === WebSocket.OPEN) {
           if (upstream.bufferedAmount > 2 * 1024 * 1024) return close(1013, 'Transcription provider is busy');
           upstream.send(data, { binary });
         } else {
@@ -196,9 +202,11 @@ server.on('upgrade', async (req, socket, head) => {
         providerReady = true;
         try {
           await store.authorize(item.token);
+          if (closed || upstream.readyState !== WebSocket.OPEN) return;
           clearTimeout(connectTimeout);
           for (const message of pending) upstream.send(message.data, { binary: message.binary });
           pending = []; pendingBytes = 0;
+          forwarding = true;
         } catch { close(1008, 'Session ended'); }
       };
       upstream.once('open', onUpstreamOpen);

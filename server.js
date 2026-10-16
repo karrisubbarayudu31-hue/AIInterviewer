@@ -1,5 +1,6 @@
 "use strict";
 const http = require('node:http');
+const { performance } = require('node:perf_hooks');
 const ws = require('ws');
 const { makeStore, hash, secret, HttpError } = require('./store');
 const compat = require('./compat');
@@ -48,6 +49,7 @@ async function credential(user, token) {
 const ticketCleanup = setInterval(() => { for (const [key, item] of tickets) if (item.expires <= Date.now()) tickets.delete(key); }, 10000);
 ticketCleanup.unref();
 const server = http.createServer(async (req, res) => {
+  const startedAt = performance.now();
   try {
     const url = new URL(req.url, 'http://server');
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true });
@@ -58,8 +60,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await store.login(await body(req, 8192)));
     }
     const token = bearer(req);
-    const user = await store.authorize(token);
     const isChat = url.pathname === '/api/chat' && req.method === 'POST';
+    const prepared = isChat && store.prepareChat ? await store.prepareChat(token, dailyLimit) : null;
+    const user = prepared ? prepared.user : await store.authorize(token);
     if (!isChat) await store.quota('requests:' + user.id, 600, 60000);
     if (url.pathname === '/auth/status' && req.method === 'GET') return json(res, 200, { email: user.email, expiresAt: user.expiresAt });
     if (url.pathname === '/auth/logout' && req.method === 'POST') {
@@ -72,7 +75,7 @@ const server = http.createServer(async (req, res) => {
     try {
       // These independent operations used to add three database round trips
       // before model generation. Keep all checks, but overlap their latency.
-      const [record, chatInput] = isChat ? await Promise.all([
+      const [record, chatInput] = prepared ? [prepared.record, await body(req)] : isChat ? await Promise.all([
         store.load(user.id), body(req),
         store.quota('requests:' + user.id, 600, 60000),
         store.quota('answers:' + user.id, dailyLimit, 86400000)
@@ -82,17 +85,34 @@ const server = http.createServer(async (req, res) => {
         let answer;
         if (url.pathname === '/api/chat' && req.method === 'POST') {
           const input = chatInput;
+          const readyAt = performance.now();
+          res.setHeader('Server-Timing', 'prepare;dur=' + (readyAt - startedAt).toFixed(1));
           const streamId = compat.startSse(res);
+          let firstTextAt;
+          const reportTiming = outcome => {
+            // Never log prompts, documents, account details, tokens or model output.
+            const timings = { event: 'answer_timing', outcome,
+              prepareMs: Math.round(readyAt - startedAt),
+              firstTextMs: firstTextAt === undefined ? null : Math.round(firstTextAt - startedAt),
+              modelFirstTextMs: firstTextAt === undefined ? null : Math.round(firstTextAt - readyAt),
+              totalMs: Math.round(performance.now() - startedAt) };
+            (dependencies.logTiming || console.info)(JSON.stringify(timings));
+          };
           const keepAlive = setInterval(() => { if (!res.writableEnded) res.write(': waiting\n\n'); }, 10000);
           keepAlive.unref();
           try {
             const question = compat.promptFromChat(input);
-            answer = await compat.requestCompletionStream(null, input, delta => compat.writeSseDelta(res, delta));
+            answer = await compat.requestCompletionStream(null, input, delta => {
+              if (delta && firstTextAt === undefined) firstTextAt = performance.now();
+              compat.writeSseDelta(res, delta);
+            });
             compat.rememberConversation(input, question, answer);
             await store.authorize(token);
             if (state.dirty) await store.save(user.id, record.version, state.data);
+            reportTiming('complete');
             return compat.finishSse(res, streamId);
           } catch (error) {
+            reportTiming('error');
             return compat.writeSseError(res, error, streamId);
           } finally { clearInterval(keepAlive); }
         }

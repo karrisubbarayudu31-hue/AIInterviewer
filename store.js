@@ -27,13 +27,28 @@ function makeStore(env, fetcher = fetch) {
     if (!item || item.revoked || Date.parse(item.expires_at) <= Date.now()) throw new HttpError(403, 'Your license is inactive, expired, or revoked.');
     return item;
   }
-  async function authorize(token) {
+  async function sessionFor(token) {
     if (typeof token !== 'string' || !/^[\w-]{43}$/.test(token)) throw new HttpError(401, 'Please sign in.');
     const found = await rows('omer_sessions', 'token_hash=eq.' + hash(token) + '&select=*');
     const item = found[0];
     if (!item || Date.parse(item.expires_at) <= Date.now()) throw new HttpError(401, 'Your session has expired. Please sign in.');
+    return item;
+  }
+  async function authorize(token) {
+    const item = await sessionFor(token);
     const active = await license(item.user_id);
     return { id: item.user_id, email: active.email, license: active, expiresAt: item.expires_at };
+  }
+  async function prepareChat(token, dailyLimit) {
+    const item = await sessionFor(token);
+    // No authorization cache: check the current license on every answer.
+    // Only a valid session may start these independent database operations.
+    const [active, record] = await Promise.all([
+      license(item.user_id), load(item.user_id),
+      quota('requests:' + item.user_id, 600, 60000),
+      quota('answers:' + item.user_id, dailyLimit, 86400000)
+    ]);
+    return { user: { id: item.user_id, email: active.email, license: active, expiresAt: item.expires_at }, record };
   }
   async function quota(bucket, limit, milliseconds) {
     const slot = Math.floor(Date.now() / milliseconds);
@@ -80,6 +95,6 @@ function makeStore(env, fetcher = fetch) {
     });
     if (!result.length) throw new HttpError(409, 'Data changed in another request. Please retry.');
   }
-  return { call, rows, license, authorize, quota, login, load, save };
+  return { call, rows, license, authorize, prepareChat, quota, login, load, save };
 }
 module.exports = { makeStore, hash, secret, HttpError };

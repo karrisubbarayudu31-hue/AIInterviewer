@@ -14,7 +14,12 @@ function serverSettings(env) {
   let provider = env.MODEL_PROVIDER || 'openai';
   if (baseUrl.hostname === 'generativelanguage.googleapis.com') provider = /\/openai\/?$/.test(baseUrl.pathname) ? 'openai' : 'gemini';
   if (!['openai', 'gemini', 'anthropic'].includes(provider)) throw Error('MODEL_PROVIDER must be openai, gemini, or anthropic');
-  return { publicUrl: publicUrl.origin, config: {
+  const speechmaticsRealtimeUrl = new URL(String(env.SPEECHMATICS_RT_URL || 'wss://eu.rt.speechmatics.com/v2').trim());
+  if (speechmaticsRealtimeUrl.protocol !== 'wss:' || !['eu.rt.speechmatics.com', 'global.rt.speechmatics.com', 'us.rt.speechmatics.com', 'au.rt.speechmatics.com'].includes(speechmaticsRealtimeUrl.hostname)
+    || speechmaticsRealtimeUrl.pathname.replace(/\/+$/, '') !== '/v2' || speechmaticsRealtimeUrl.username || speechmaticsRealtimeUrl.password || speechmaticsRealtimeUrl.search || speechmaticsRealtimeUrl.hash) {
+    throw Error('SPEECHMATICS_RT_URL must be a supported Speechmatics Realtime v2 endpoint');
+  }
+  return { publicUrl: publicUrl.origin, speechmaticsRealtimeUrl: speechmaticsRealtimeUrl.toString().replace(/\/$/, ''), config: {
     provider, baseUrl: baseUrl.toString().replace(/\/+$/, ''),
     apiKey: env.MODEL_API_KEY, model: env.MODEL_NAME, authMode: env.MODEL_AUTH_MODE || 'api-key'
   } };
@@ -23,7 +28,7 @@ function createService(env, dependencies = {}) {
 const WebSocket = dependencies.WebSocket || ws.WebSocket;
 const WebSocketServer = ws.WebSocketServer;
 for (const key of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'MODEL_API_KEY', 'MODEL_NAME']) if (!env[key]) throw Error('Missing server environment: ' + key);
-const { publicUrl, config } = serverSettings(env);
+const { publicUrl, speechmaticsRealtimeUrl, config } = serverSettings(env);
 const store = dependencies.store || makeStore(env);
 const dailyLimit = Number(env.DAILY_ANSWER_LIMIT || 100);
 const dailySpeech = Number(env.DAILY_TRANSCRIPTION_LIMIT || 20);
@@ -187,7 +192,7 @@ server.on('upgrade', async (req, socket, head) => {
         endpointing: '300', utterance_end_ms: '800', vad_events: 'true', mip_opt_out: 'true'
       });
       upstream = new WebSocket('wss://api.deepgram.com/v1/listen?' + q, { headers: { Authorization: 'Token ' + env.DEEPGRAM_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
-    } else upstream = new WebSocket('wss://global.rt.speechmatics.com/v2', { headers: { Authorization: 'Bearer ' + env.SPEECHMATICS_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
+    } else upstream = new WebSocket(speechmaticsRealtimeUrl, { headers: { Authorization: 'Bearer ' + env.SPEECHMATICS_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
     wss.handleUpgrade(req, socket, head, downstream => {
       let closed = false;
       let checking = false;

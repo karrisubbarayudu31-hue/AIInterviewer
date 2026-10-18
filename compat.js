@@ -159,7 +159,35 @@ async function handleProcedure(name, input) {
       data.transcripts[id] = [...(data.transcripts[id] || []), ...entries]; writeData(data); return true;
     }
     case "callSession.aiMessages.get": return data.messages[input.callSessionId] || [];
-    case "callSession.scrapeJobPost.scrape": return { title: "", company: "", description: String(input.url || input.text || "") };
+    case "callSession.searchCompanies": {
+      const query = String(input?.query || "").trim().slice(0, 120);
+      if (!query) return [];
+      const companies = [
+        ["Accenture", "accenture.com"], ["Adobe", "adobe.com"], ["Amazon", "amazon.com"],
+        ["Apple", "apple.com"], ["Capgemini", "capgemini.com"], ["Cognizant", "cognizant.com"],
+        ["Deloitte", "deloitte.com"], ["Google", "google.com"], ["HCLTech", "hcltech.com"],
+        ["IBM", "ibm.com"], ["Infosys", "infosys.com"], ["Meta", "meta.com"],
+        ["Microsoft", "microsoft.com"], ["Oracle", "oracle.com"], ["Salesforce", "salesforce.com"],
+        ["Tata Consultancy Services", "tcs.com"], ["Tech Mahindra", "techmahindra.com"],
+        ["Wipro", "wipro.com"]
+      ].map(([companyName, domain]) => ({ name: companyName, domain }));
+      const lower = query.toLowerCase();
+      const matches = companies.filter(company => company.name.toLowerCase().includes(lower) || company.domain.includes(lower)).slice(0, 8);
+      if (!matches.some(company => company.name.toLowerCase() === lower)) matches.unshift({ name: query, domain: "" });
+      return matches.slice(0, 8);
+    }
+    case "callSession.scrapeJobPost.scrape": {
+      const raw = String(input?.url || input?.text || "").trim();
+      let jobUrl;
+      try { jobUrl = new URL(/^https?:\/\//i.test(raw) ? raw : "https://" + raw); }
+      catch { throw Object.assign(new Error("Enter a valid job link."), { status: 400 }); }
+      if (jobUrl.protocol !== "https:" || jobUrl.username || jobUrl.password) {
+        throw Object.assign(new Error("Enter a valid HTTPS job link."), { status: 400 });
+      }
+      const host = jobUrl.hostname.replace(/^www\./i, "");
+      const companyName = host.split(".")[0].replace(/[-_]+/g, " ").replace(/\b\w/g, character => character.toUpperCase());
+      return { companyName, jobDescription: "Job post: " + jobUrl.href };
+    }
     case "callDocument.getMany": return { data: data.documents, nextCursor: null };
     case "resume.getMany": return { data: data.resumes, nextCursor: null };
     case "speakerEnrollment.list": return [];

@@ -4,6 +4,18 @@ const { performance } = require('node:perf_hooks');
 const ws = require('ws');
 const { makeStore, hash, secret, HttpError } = require('./store');
 const compat = require('./compat');
+const blockedJsonKeys = new Set(['__proto__', 'prototype', 'constructor']);
+function parseJson(value) {
+  try {
+    return JSON.parse(value || '{}', (key, item) => {
+      if (blockedJsonKeys.has(key)) throw new HttpError(400, 'Invalid request.');
+      return item;
+    });
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(400, 'Invalid request.');
+  }
+}
 function serverSettings(env) {
   const address = String(env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || '').trim();
   if (!address) throw Error('Missing PUBLIC_URL or Render-provided RENDER_EXTERNAL_URL');
@@ -40,7 +52,7 @@ const json = (res, status, value) => { res.writeHead(status, { 'content-type': '
 async function body(req, limit = 6 * 1024 * 1024) {
   let size = 0; const parts = [];
   for await (const chunk of req) { size += chunk.length; if (size > limit) throw new HttpError(413, 'Request too large.'); parts.push(chunk); }
-  try { return JSON.parse(Buffer.concat(parts).toString() || '{}'); } catch { throw new HttpError(400, 'Invalid request.'); }
+  return parseJson(Buffer.concat(parts).toString());
 }
 const bearer = req => /^Bearer ([\w-]+)$/.exec(req.headers.authorization || '')?.[1];
 async function credential(user, token) {
@@ -56,8 +68,19 @@ ticketCleanup.unref();
 const server = http.createServer(async (req, res) => {
   const startedAt = performance.now();
   try {
+    res.setHeader('cache-control', 'no-store');
+    res.setHeader('content-security-policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+    res.setHeader('permissions-policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+    res.setHeader('referrer-policy', 'no-referrer');
+    res.setHeader('strict-transport-security', 'max-age=31536000; includeSubDomains');
+    res.setHeader('x-content-type-options', 'nosniff');
+    res.setHeader('x-frame-options', 'DENY');
+    if (String(req.url || '').length > 65536) throw new HttpError(414, 'Request URL too long.');
     const url = new URL(req.url, 'http://server');
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true });
+    if (req.method === 'POST' && !/^application\/json(?:\s*;|$)/i.test(String(req.headers['content-type'] || ''))) {
+      throw new HttpError(415, 'Use application/json.');
+    }
     if (req.method === 'POST' && url.pathname === '/auth/login') {
       // Render appends the actual client address; never trust the first X-Forwarded-For value.
       const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',').pop().trim();
@@ -70,8 +93,9 @@ const server = http.createServer(async (req, res) => {
     const user = prepared ? prepared.user : await store.authorize(token);
     if (!isChat) await store.quota('requests:' + user.id, 600, 60000);
     if (url.pathname === '/auth/status' && req.method === 'GET') return json(res, 200, { email: user.email, expiresAt: user.expiresAt });
+    if (url.pathname === '/auth/rotate' && req.method === 'POST') return json(res, 200, await store.rotate(token));
     if (url.pathname === '/auth/logout' && req.method === 'POST') {
-      await store.call('/rest/v1/omer_sessions?token_hash=eq.' + hash(token), { method: 'DELETE' });
+      await store.call('/rest/v1/omer_sessions?token_hash=eq.' + encodeURIComponent(hash(token)), { method: 'DELETE' });
       for (const entry of streams.get(user.id) || []) entry.close();
       return json(res, 200, { ok: true });
     }
@@ -123,19 +147,30 @@ const server = http.createServer(async (req, res) => {
         }
         if (url.pathname === '/library/import' && req.method === 'POST') {
           const input = await body(req);
-          if (!Array.isArray(input.items) || input.items.length > 10) throw new HttpError(400, 'Invalid documents.');
+          if (!['resume', 'document'].includes(input.kind) || !Array.isArray(input.items) || input.items.length > 10) throw new HttpError(400, 'Invalid documents.');
+          const allowedTypes = new Set(['application/pdf', 'application/rtf', 'text/plain', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']);
+          let importedBytes = 0;
           const target = input.kind === 'resume' ? state.data.resumes : state.data.documents;
-          const imported = input.items.map(item => ({ id: require('node:crypto').randomUUID(), userId: user.id,
-            title: String(item.title || '').slice(0, 256), fileName: String(item.fileName || '').slice(0, 256),
-            mimeType: String(item.mimeType || ''), fileSizeBytes: Number(item.fileSizeBytes || 0),
-            content: String(item.content || ''), rawBase64: item.mimeType === 'application/pdf' ? String(item.rawBase64 || '') : '',
-            createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
+          const imported = input.items.map(item => {
+            if (!item || typeof item !== 'object' || Array.isArray(item)) throw new HttpError(400, 'Invalid document.');
+            const mimeType = String(item.mimeType || '').toLowerCase();
+            const content = String(item.content || '');
+            const rawBase64 = mimeType === 'application/pdf' ? String(item.rawBase64 || '') : '';
+            if (!allowedTypes.has(mimeType) || content.length > 4 * 1024 * 1024 || (rawBase64 && !/^[A-Za-z0-9+/]*={0,2}$/.test(rawBase64))) throw new HttpError(400, 'Invalid document.');
+            const rawBytes = rawBase64 ? Buffer.byteLength(rawBase64, 'base64') : 0;
+            importedBytes += Buffer.byteLength(content) + rawBytes;
+            if (rawBytes > 4 * 1024 * 1024 || importedBytes > 5 * 1024 * 1024) throw new HttpError(413, 'Documents are too large.');
+            return { id: require('node:crypto').randomUUID(), userId: user.id,
+              title: String(item.title || '').slice(0, 256), fileName: String(item.fileName || '').slice(0, 256), mimeType,
+              fileSizeBytes: Math.max(0, Math.min(Number(item.fileSizeBytes || 0) || 0, 4 * 1024 * 1024)),
+              content, rawBase64, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+          });
           target.unshift(...imported); state.dirty = true;
           answer = { canceled: false, imported: imported.map(({ id, title }) => ({ id, title })) };
         } else if (url.pathname.startsWith('/api/trpc/') && ['GET', 'POST'].includes(req.method)) {
           const names = decodeURIComponent(url.pathname.slice(10)).split(',');
           if (names.length > 30) throw new HttpError(400, 'Too many operations.');
-          const inputs = req.method === 'GET' ? JSON.parse(url.searchParams.get('input') || '{}') : await body(req);
+          const inputs = req.method === 'GET' ? parseJson(url.searchParams.get('input') || '{}') : await body(req);
           const values = [];
           for (let index = 0; index < names.length; index++) {
             try {
@@ -258,6 +293,9 @@ server.on('upgrade', async (req, socket, head) => {
 });
 server.requestTimeout = 130000;
 server.headersTimeout = 15000;
+server.keepAliveTimeout = 5000;
+server.maxHeadersCount = 64;
+server.on('clientError', (_error, socket) => { if (!socket.destroyed) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); });
 return { server, close() { clearInterval(ticketCleanup); for (const entries of streams.values()) for (const entry of entries) entry.close(); server.close(); server.closeAllConnections(); } };
 }
 module.exports = { createService, serverSettings };

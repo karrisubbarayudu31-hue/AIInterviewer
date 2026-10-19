@@ -20,16 +20,17 @@ function makeStore(env, fetcher = fetch) {
     if (!response.ok) throw new HttpError(response.status === 409 ? 409 : 503, 'Account service unavailable. Please retry.');
     return value;
   }
+  const filter = value => encodeURIComponent(String(value));
   const rows = (table, query) => call('/rest/v1/' + table + '?' + query);
   async function license(userId) {
-    const found = await rows('omer_licenses', 'user_id=eq.' + encodeURIComponent(userId) + '&select=*');
+    const found = await rows('omer_licenses', 'user_id=eq.' + filter(userId) + '&select=*');
     const item = found[0];
     if (!item || item.revoked || Date.parse(item.expires_at) <= Date.now()) throw new HttpError(403, 'Your license is inactive, expired, or revoked.');
     return item;
   }
   async function sessionFor(token) {
     if (typeof token !== 'string' || !/^[\w-]{43}$/.test(token)) throw new HttpError(401, 'Please sign in.');
-    const found = await rows('omer_sessions', 'token_hash=eq.' + hash(token) + '&select=*');
+    const found = await rows('omer_sessions', 'token_hash=eq.' + filter(hash(token)) + '&select=*');
     const item = found[0];
     if (!item || Date.parse(item.expires_at) <= Date.now()) throw new HttpError(401, 'Your session has expired. Please sign in.');
     return item;
@@ -70,31 +71,51 @@ function makeStore(env, fetcher = fetch) {
     if (!response.ok || !auth.user?.id || !auth.user.email_confirmed_at) throw new HttpError(401, 'Sign-in failed. Check your credentials and confirm your email.');
     const id = auth.user.id;
     if (input.licenseKey) {
-      const found = await rows('omer_licenses', 'key_hash=eq.' + hash(String(input.licenseKey).trim()) + '&select=*');
+      const licenseKey = String(input.licenseKey).trim();
+      if (!licenseKey || licenseKey.length > 512) throw new HttpError(400, 'Enter a valid license key.');
+      const found = await rows('omer_licenses', 'key_hash=eq.' + filter(hash(licenseKey)) + '&select=*');
       const item = found[0];
       if (!item || item.email.toLowerCase() !== email || item.revoked || Date.parse(item.expires_at) <= Date.now() || (item.user_id && item.user_id !== id)) throw new HttpError(403, 'License activation failed. Contact the owner.');
-      if (!item.user_id) await call('/rest/v1/omer_licenses?id=eq.' + item.id + '&user_id=is.null&revoked=eq.false', {
+      if (!item.user_id) await call('/rest/v1/omer_licenses?id=eq.' + filter(item.id) + '&user_id=is.null&revoked=eq.false', {
         method: 'PATCH', body: JSON.stringify({ user_id: id })
       });
     }
     const active = await license(id);
     const token = secret();
-    const expiresAt = new Date(Math.min(Date.now() + 8 * 3600000, Date.parse(active.expires_at))).toISOString();
+    // The encrypted desktop token remains valid until the license expires. Every
+    // request still checks the current license, and startup rotation invalidates
+    // the previous token so a copied token does not remain useful indefinitely.
+    const expiresAt = new Date(Date.parse(active.expires_at)).toISOString();
     await call('/rest/v1/omer_sessions', { method: 'POST', body: JSON.stringify({ token_hash: hash(token), user_id: id, expires_at: expiresAt }) });
     return { token, expiresAt, email };
   }
+  async function rotate(token) {
+    const user = await authorize(token);
+    const next = secret();
+    await call('/rest/v1/omer_sessions', { method: 'POST', body: JSON.stringify({
+      token_hash: hash(next), user_id: user.id, expires_at: user.expiresAt
+    }) });
+    try {
+      await call('/rest/v1/omer_sessions?token_hash=eq.' + filter(hash(token)), { method: 'DELETE' });
+    } catch (error) {
+      // Do not leave two usable tokens if cleanup fails.
+      await call('/rest/v1/omer_sessions?token_hash=eq.' + filter(hash(next)), { method: 'DELETE' }).catch(() => {});
+      throw error;
+    }
+    return { token: next, expiresAt: user.expiresAt, email: user.email };
+  }
   async function load(id) {
-    const found = await rows('omer_data', 'user_id=eq.' + id + '&select=*');
+    const found = await rows('omer_data', 'user_id=eq.' + filter(id) + '&select=*');
     return found[0] || { version: 0, payload: { sessions: [], resumes: [], documents: [], transcripts: {}, messages: {} } };
   }
   async function save(id, version, payload) {
     if (Buffer.byteLength(JSON.stringify(payload)) > 9 * 1024 * 1024) throw new HttpError(413, 'Cloud data limit reached. Remove old sessions or documents.');
     if (!version) return call('/rest/v1/omer_data', { method: 'POST', body: JSON.stringify({ user_id: id, version: 1, payload }) });
-    const result = await call('/rest/v1/omer_data?user_id=eq.' + id + '&version=eq.' + version, {
+    const result = await call('/rest/v1/omer_data?user_id=eq.' + filter(id) + '&version=eq.' + filter(version), {
       method: 'PATCH', headers: { Prefer: 'return=representation' }, body: JSON.stringify({ version: version + 1, payload })
     });
     if (!result.length) throw new HttpError(409, 'Data changed in another request. Please retry.');
   }
-  return { call, rows, license, authorize, prepareChat, quota, login, load, save };
+  return { call, rows, license, authorize, prepareChat, quota, login, rotate, load, save };
 }
 module.exports = { makeStore, hash, secret, HttpError };

@@ -289,7 +289,15 @@ server.on('upgrade', async (req, socket, head) => {
         close(1011, 'Transcription provider failed');
       });
     });
-  } catch { upstream?.terminate(); release(); if (!socket.destroyed) socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); }
+  } catch (error) {
+    console.error('WebSocket upgrade rejected:', error && (error.message || error));
+    upstream?.terminate();
+    release();
+    if (!socket.destroyed) {
+      const status = error && error.status === 429 ? '429 Too Many Requests' : '403 Forbidden';
+      socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
+    }
+  }
 });
 server.requestTimeout = 130000;
 server.headersTimeout = 15000;

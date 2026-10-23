@@ -52,6 +52,7 @@ function makeStore(env, fetcher = fetch) {
     return { user: { id: item.user_id, email: active.email, license: active, expiresAt: item.expires_at }, record };
   }
   async function quota(bucket, limit, milliseconds) {
+    if (limit >= 999999 || limit <= 0) return;
     const slot = Math.floor(Date.now() / milliseconds);
     const allowed = await call('/rest/v1/rpc/omer_take_quota', { method: 'POST', body: JSON.stringify({
       p_bucket: bucket + ':' + slot, p_limit: limit, p_expires: new Date((slot + 1) * milliseconds).toISOString()

@@ -35,15 +35,29 @@ function normalizeDeepgramModel(value) {
   if (!/^[a-z0-9][a-z0-9._-]{0,79}$/i.test(model)) throw new Error("Enter a valid Deepgram model name.");
   return model;
 }
+let geminiKeyIndex = 0;
+function parseApiKeys(raw) {
+  if (Array.isArray(raw)) return raw.flatMap(parseApiKeys);
+  return String(raw || '').split(/[,;|\s]+/).map(s => s.trim()).filter(Boolean);
+}
+function getOrderedApiKeys(rawKey) {
+  const keys = parseApiKeys(rawKey);
+  if (keys.length <= 1) return keys;
+  const start = geminiKeyIndex % keys.length;
+  geminiKeyIndex = (geminiKeyIndex + 1) % keys.length;
+  return [...keys.slice(start), ...keys.slice(0, start)];
+}
 function geminiModelsUrl(baseUrl, apiKey) {
   let base = String(baseUrl).replace(/\/+$/, "").replace(/\/models$/i, "");
-  return base + "/models?key=" + encodeURIComponent(apiKey);
+  const firstKey = parseApiKeys(apiKey)[0] || '';
+  return base + "/models?key=" + encodeURIComponent(firstKey);
 }
 function geminiGenerateUrl(baseUrl, model, apiKey) {
   let base = String(baseUrl).replace(/\/+$/, "");
-  if (/:generateContent$/i.test(base)) return base + "?key=" + encodeURIComponent(apiKey);
+  const firstKey = parseApiKeys(apiKey)[0] || '';
+  if (/:generateContent$/i.test(base)) return base + "?key=" + encodeURIComponent(firstKey);
   base = base.replace(/\/models$/i, "");
-  return base + "/models/" + encodeURIComponent(String(model).replace(/^models\//, "")) + ":generateContent?key=" + encodeURIComponent(apiKey);
+  return base + "/models/" + encodeURIComponent(String(model).replace(/^models\//, "")) + ":generateContent?key=" + encodeURIComponent(firstKey);
 }
 function normalizeAuthMode(value, provider, baseUrl) {
   const mode = String(value || "auto").trim().toLowerCase();
@@ -342,6 +356,21 @@ function answerStyleInstructions(chatBody) {
   const length = value("responseLength", "balanced");
   const format = value("responseFormat", "balanced");
   const tone = value("responseTone", "simple");
+  const allowedFocuses = new Set(["auto", "c", "cpp", "java", "ai-ml", "cloud-devops", "system-design", "data-sql", "frontend-js", "cybersecurity"]);
+  const focus = allowedFocuses.has(chatBody.interviewFocus) ? chatBody.interviewFocus : "auto";
+  const company = [value("title", ""), value("companyDomain", ""), value("companyName", "")].join(" ").toLowerCase();
+  const focusRules = {
+    auto: "Interview focus: infer the primary technology from the question, job description, resume, and recent conversation. Do not force an unrelated language or framework.",
+    c: "Interview focus: C. Emphasize pointers and ownership, memory layout and lifetime, undefined behavior, arrays and strings, structs, compilation/linking, portability, concurrency, and performance. For code, use valid C, trace memory carefully, cover failure paths, and state complexity.",
+    cpp: "Interview focus: C++. Emphasize RAII, value/reference semantics, object lifetime, smart pointers, STL choices, const-correctness, copy/move behavior, templates, exceptions, concurrency, and performance. Prefer modern, idiomatic C++ and explain ownership and complexity.",
+    java: "Interview focus: Java. Explain JVM behavior where relevant, collections and their complexity, generics, immutability, exceptions, concurrency and the memory model, garbage collection, testing, and common backend/Spring trade-offs. Give clean, compilable Java and discuss production concerns.",
+    "ai-ml": "Interview focus: AI and machine learning. Structure answers around problem framing, data and labels, baselines, features or representations, model choice, training and validation, metrics, leakage and bias, error analysis, deployment, latency/cost, monitoring and drift, safety, and iteration. For generative AI include prompting/RAG/fine-tuning choices, retrieval quality, groundedness, evaluation, guardrails, and human review.",
+    "cloud-devops": "Interview focus: cloud and DevOps. Start from workload and SLOs, then cover architecture, networking, identity and least privilege, data/storage, scaling, high availability and disaster recovery, deployment and rollback, infrastructure as code, observability, incident response, security, compliance, and cost. Name a vendor service only when it clarifies the design and mention a portable alternative.",
+    "system-design": "Interview focus: system design. Clarify functional and non-functional requirements, estimate scale, define APIs and data model, show components and data flow, then address consistency, partitioning, caching, queues, failure modes, security, observability, cost, and explicit trade-offs. Evolve from a simple design to the required scale.",
+    "data-sql": "Interview focus: data and SQL. Clarify grain and correctness, explain schema and joins, provide readable SQL, discuss indexes and query plans, transactions and isolation, null/duplicate handling, data quality, scale, and validation. For analytics connect the result to a decision and an appropriate metric.",
+    "frontend-js": "Interview focus: frontend and JavaScript. Cover browser/runtime behavior, event loop and async work, state and data flow, component design, accessibility, performance, security, testing, compatibility, and user experience. Give clear JavaScript or TypeScript with edge cases and explain framework-specific choices only when relevant.",
+    cybersecurity: "Interview focus: cybersecurity. State assets, trust boundaries, threat model and assumptions; prioritize risks by likelihood and impact; recommend layered controls, least privilege, secure defaults, validation, secrets management, logging and detection, response, and verification. For vulnerabilities explain the root cause and safe remediation without inventing evidence."
+  };
   const rules = [
     length === "concise"
       ? "Length: concise, normally 50-90 words unless the question requires code or a list."
@@ -359,13 +388,23 @@ function answerStyleInstructions(chatBody) {
   ];
   if (value("useStarMethod", false)) rules.push("For behavioral or experience questions, explicitly structure the answer as Situation, Task, Action, and Result.");
   if (value("useFillerWords", false) && format !== "bullets") rules.push("Use a few natural spoken transitions such as 'well' or 'for example', without overusing them.");
-  rules.push("Infer the current question type from the question itself and adapt the content: behavioral, coding, experience, how-to, situational, system design, technical knowledge, or introduction.");
+  rules.push(focusRules[focus]);
+  if (/amazon|aws/.test(company)) rules.push("Company emphasis—Amazon/AWS: connect behavioral evidence to relevant Leadership Principles, use STAR, distinguish the candidate's own actions, and include truthful metrics. For technical choices explain customer impact, ownership, operational readiness, and trade-offs.");
+  else if (/microsoft|azure/.test(company)) rules.push("Company emphasis—Microsoft/Azure: show collaborative problem solving, clarify assumptions, reason step by step, test the solution, discuss customer impact and trade-offs, and demonstrate learning from feedback.");
+  else if (/google|alphabet/.test(company)) rules.push("Company emphasis—Google: make the reasoning explicit, clarify constraints, derive a correct and efficient solution, test edge cases, and discuss scalability, reliability, and collaboration. Avoid memorized answers without justification.");
+  else if (/meta|facebook|instagram|whatsapp/.test(company)) rules.push("Company emphasis—Meta: communicate the approach while coding, produce working code efficiently, analyze complexity and follow-up optimizations, and connect design decisions to product impact and operation at scale.");
+  else if (/oracle/.test(company)) rules.push("Company emphasis—Oracle: answer the question directly, show the individual contribution rather than vague team claims, support experience with facts or figures, and demonstrate structured technical problem solving and role-specific preparation.");
+  else if (/apple/.test(company)) rules.push("Company emphasis—Apple: demonstrate technical depth, product quality, privacy and security awareness, careful trade-offs, and effective cross-functional collaboration while protecting confidential information.");
+  else if (/netflix/.test(company)) rules.push("Company emphasis—Netflix: show sound judgment, ownership, candid communication, high-leverage decisions, and engineering for reliability, performance, and business impact.");
+  rules.push("Lead with a direct, speakable answer in one or two sentences, then support it with the depth selected by the user. Write for live speech: short sentences, one idea at a time, concrete wording, and no dense wall of text.");
+  rules.push("Infer the question type and use the matching interview structure. Technical knowledge: definition, how it works, when to use it, trade-offs, and a practical example. Coding or algorithms: clarify assumptions, explain the approach, give correct code or pseudocode when requested, state time and space complexity, and cover edge cases. System design: requirements and scale assumptions, architecture and data flow, APIs and data model, scaling and failure handling, security and observability, then explicit trade-offs. Troubleshooting: likely causes, a prioritized diagnostic sequence, the fix, validation, and prevention. Behavioral or project experience: use STAR and only facts supported by the resume or session context.");
+  rules.push("For follow-up questions, use recent conversation context and answer the new point without restarting the entire explanation. If a necessary detail is missing, state a reasonable assumption briefly instead of stalling.");
   return rules.join("\n");
 }
 function systemPrompt(chatBody) {
   const context = sessionContext(chatBody || {});
   const style = answerStyleInstructions(chatBody || {});
-  const base = "You are a real-time interview and meeting assistant. Answer the current spoken, typed, or on-screen question directly and accurately. Treat recent question-and-answer turns as one continuous conversation: resolve pronouns and follow-up phrases from that history, preserve relevant facts, and do not repeat earlier material unless it helps answer the new question. Ground personal-experience answers in the supplied resume, tailor role answers to the job description, and use selected documents when relevant. If the question is outside those materials, answer it from reliable general knowledge. Never invent the user's personal experience, employers, skills, or achievements. Follow the requested answer style even when it requires a longer response.";
+  const base = "You are an expert real-time technical interview assistant. Produce an accurate answer the candidate can speak naturally, with enough technical depth to satisfy a senior interviewer. Answer the current spoken, typed, or on-screen question first; do not waste time with an introduction. Treat recent question-and-answer turns as one continuous conversation: resolve pronouns and follow-up phrases from that history, preserve relevant facts, and do not repeat earlier material unless it helps answer the new question. Ground personal-experience answers in the supplied resume, tailor role answers to the job description and company context, and use selected documents when relevant. If the question is outside those materials, answer it from reliable general knowledge. Distinguish facts, assumptions, and recommendations. Never invent the user's personal experience, employers, skills, metrics, or achievements. For ambiguous technical questions, state the most likely interpretation and proceed. Follow the requested length, format, and tone while preserving correctness, key trade-offs, and interview-ready clarity.";
   return base + "\n\nANSWER STYLE\n" + style + (context ? "\n\nSESSION CONTEXT\n" + context : "");
 }
 function screenshotAttachments(chatBody) {
@@ -457,7 +496,7 @@ async function requestCompletion(payloadConfig, chatBody) {
   const screenshots = screenshotAttachments(chatBody || {});
   let prompt = promptFromChat(chatBody || {});
   if (screenshots.length && chatTrigger(chatBody).kind === "analyze-screen") {
-    prompt = "Analyze the attached screenshot and answer the visible question or provide the requested help.\n\n" + prompt;
+    prompt = "Inspect the attached screenshot carefully. Read the visible question, code, error, diagram, table, and answer choices before responding. Solve the exact on-screen task and explain the reasoning at an interview-ready level. For code, identify the language, defects, edge cases, corrected approach, and complexity when relevant. For multiple choice, name the selected option and justify it. Do not invent text that is not readable; if a critical region is unclear, say exactly what is unreadable and answer from the visible evidence.\n\n" + prompt;
   }
   const system = systemPrompt(chatBody || {});
   const history = conversationHistory(chatBody || {});
@@ -481,18 +520,29 @@ async function requestCompletion(payloadConfig, chatBody) {
   if (config.provider === "gemini") {
     const model = String(config.model).replace(/^models\//, "");
     const documentParts = geminiDocumentParts(chatBody || {});
-    const parsed = await fetchJson(geminiGenerateUrl(config.baseUrl, model, config.apiKey), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: system }] },
-        contents: [
-          ...history.map(turn => ({ role: turn.role === "assistant" ? "model" : "user", parts: [{ text: turn.content }] })),
-          { role: "user", parts: [...documentParts, ...screenshots.map(item => ({ inlineData: { mimeType: item.mediaType, data: item.data } })), { text: prompt }] }
-        ]
-      })
-    }, "Gemini request failed");
-    return (parsed.candidates || []).flatMap(item => item && item.content && item.content.parts || []).map(item => item.text || "").join("");
+    const keys = getOrderedApiKeys(config.apiKey);
+    let lastError;
+    for (const key of keys) {
+      try {
+        const parsed = await fetchJson(geminiGenerateUrl(config.baseUrl, model, key), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: system }] },
+            contents: [
+              ...history.map(turn => ({ role: turn.role === "assistant" ? "model" : "user", parts: [{ text: turn.content }] })),
+              { role: "user", parts: [...documentParts, ...screenshots.map(item => ({ inlineData: { mimeType: item.mediaType, data: item.data } })), { text: prompt }] }
+            ]
+          })
+        }, "Gemini request failed");
+        return (parsed.candidates || []).flatMap(item => item && item.content && item.content.parts || []).map(item => item.text || "").join("");
+      } catch (err) {
+        lastError = err;
+        if (keys.length > 1 && [408, 409, 425, 429, 500, 502, 503, 504].includes(err.status)) continue;
+        throw err;
+      }
+    }
+    throw lastError || new Error("All Gemini API keys failed.");
   }
   const parsed = await fetchJson(config.baseUrl + "/chat/completions", {
     method: "POST",
@@ -518,51 +568,60 @@ async function requestCompletionStream(payloadConfig, chatBody, onDelta) {
   const screenshots = screenshotAttachments(chatBody || {});
   let prompt = promptFromChat(chatBody || {});
   if (screenshots.length && chatTrigger(chatBody).kind === "analyze-screen") {
-    prompt = "Analyze the attached screenshot and answer the visible question or provide the requested help.\n\n" + prompt;
+    prompt = "Inspect the attached screenshot carefully. Read the visible question, code, error, diagram, table, and answer choices before responding. Solve the exact on-screen task and explain the reasoning at an interview-ready level. For code, identify the language, defects, edge cases, corrected approach, and complexity when relevant. For multiple choice, name the selected option and justify it. Do not invent text that is not readable; if a critical region is unclear, say exactly what is unreadable and answer from the visible evidence.\n\n" + prompt;
   }
   const system = systemPrompt(chatBody || {});
   const history = conversationHistory(chatBody || {});
+  let provider = config.provider;
   let url;
   let options;
-  let provider = config.provider;
-  if (provider === "anthropic") {
-    const content = [
-      ...screenshots.map(item => ({ type: "image", source: { type: "base64", media_type: item.mediaType, data: item.data } })),
-      { type: "text", text: prompt }
-    ];
-    url = config.baseUrl + "/messages";
-    options = { method: "POST", headers: { "content-type": "application/json", ...providerHeaders(config) }, body: JSON.stringify({ model: config.model, max_tokens: 2048, stream: true, system, messages: [...history, { role: "user", content }] }) };
-  } else if (provider === "gemini") {
-    const model = String(config.model).replace(/^models\//, "");
-    const documentParts = geminiDocumentParts(chatBody || {});
-    url = geminiGenerateUrl(config.baseUrl, model, config.apiKey).replace(":generateContent?", ":streamGenerateContent?alt=sse&");
-    options = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
-      systemInstruction: { parts: [{ text: system }] },
-      contents: [...history.map(turn => ({ role: turn.role === "assistant" ? "model" : "user", parts: [{ text: turn.content }] })), { role: "user", parts: [...documentParts, ...screenshots.map(item => ({ inlineData: { mimeType: item.mediaType, data: item.data } })), { text: prompt }] }]
-    }) };
-  } else {
-    provider = "openai";
-    url = config.baseUrl + "/chat/completions";
-    options = { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + config.apiKey }, body: JSON.stringify({ model: config.model, stream: true, messages: [
-      { role: "system", content: system }, ...history,
-      { role: "user", content: screenshots.length ? [{ type: "text", text: prompt }, ...screenshots.map(item => ({ type: "image_url", image_url: { url: item.dataUrl } }))] : prompt }
-    ] }) };
-  }
   let response;
   let lastError;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      response = await nativeFetch(url, options);
-      if (response.ok) break;
-      const raw = await response.text();
-      let parsed = {}; try { parsed = JSON.parse(raw); } catch (_) {}
-      lastError = Object.assign(new Error(apiError(parsed, response.status, "Model request failed")), { status: response.status });
-      if (![408, 409, 425, 429, 500, 502, 503, 504].includes(response.status)) throw lastError;
-    } catch (error) {
-      lastError = error;
-      if (error.status && ![408, 409, 425, 429, 500, 502, 503, 504].includes(error.status)) throw error;
+  const keys = provider === "gemini" ? getOrderedApiKeys(config.apiKey) : [config.apiKey];
+
+  for (const key of keys) {
+    if (provider === "anthropic") {
+      const content = [
+        ...screenshots.map(item => ({ type: "image", source: { type: "base64", media_type: item.mediaType, data: item.data } })),
+        { type: "text", text: prompt }
+      ];
+      url = config.baseUrl + "/messages";
+      options = { method: "POST", headers: { "content-type": "application/json", ...providerHeaders({ ...config, apiKey: key }) }, body: JSON.stringify({ model: config.model, max_tokens: 2048, stream: true, system, messages: [...history, { role: "user", content }] }) };
+    } else if (provider === "gemini") {
+      const model = String(config.model).replace(/^models\//, "");
+      const documentParts = geminiDocumentParts(chatBody || {});
+      url = geminiGenerateUrl(config.baseUrl, model, key).replace(":generateContent?", ":streamGenerateContent?alt=sse&");
+      options = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [...history.map(turn => ({ role: turn.role === "assistant" ? "model" : "user", parts: [{ text: turn.content }] })), { role: "user", parts: [...documentParts, ...screenshots.map(item => ({ inlineData: { mimeType: item.mediaType, data: item.data } })), { text: prompt }] }]
+      }) };
+    } else {
+      url = config.baseUrl + "/chat/completions";
+      options = { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + key }, body: JSON.stringify({ model: config.model, stream: true, messages: [
+        { role: "system", content: system }, ...history,
+        { role: "user", content: screenshots.length ? [{ type: "text", text: prompt }, ...screenshots.map(item => ({ type: "image_url", image_url: { url: item.dataUrl } }))] : prompt }
+      ] }) };
     }
-    if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 300));
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        response = await nativeFetch(url, options);
+        if (response.ok) break;
+        const raw = await response.text();
+        let parsed = {}; try { parsed = JSON.parse(raw); } catch (_) {}
+        lastError = Object.assign(new Error(apiError(parsed, response.status, "Model request failed")), { status: response.status });
+        if (![408, 409, 425, 429, 500, 502, 503, 504].includes(response.status)) break;
+      } catch (error) {
+        lastError = error;
+        if (error.status && ![408, 409, 425, 429, 500, 502, 503, 504].includes(error.status)) break;
+      }
+      if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 300));
+    }
+
+    if (response && response.ok) break;
+    if (keys.length > 1 && [408, 409, 425, 429, 500, 502, 503, 504].includes(lastError?.status)) {
+      continue;
+    }
   }
   if (!response?.ok) throw Object.assign(new Error(lastError?.message || "Model request failed. Please retry."), { status: lastError?.status || 503 });
   if (!response.body) throw new Error("The model returned an empty response.");

@@ -44,7 +44,7 @@ const { publicUrl, speechmaticsRealtimeUrl, config } = serverSettings(env);
 const store = dependencies.store || makeStore(env);
 const dailyLimit = Number(env.DAILY_ANSWER_LIMIT || 100);
 const dailySpeech = Number(env.DAILY_TRANSCRIPTION_LIMIT || 20);
-if (![dailyLimit, dailySpeech].every(n => Number.isInteger(n) && n > 0 && n <= 10000)) throw Error('Invalid usage limits');
+if (![dailyLimit, dailySpeech].every(n => Number.isInteger(n) && n > 0 && n <= 10000000)) throw Error('Invalid usage limits');
 const tickets = new Map();
 const inFlight = new Set();
 const streams = new Map();
@@ -214,7 +214,7 @@ server.on('upgrade', async (req, socket, head) => {
     // must not consume the daily allowance by itself.
     await store.quota('speech:' + user.id, dailySpeech, 86400000);
     const active = streams.get(user.id) || new Set();
-    if (active.size >= 2) throw Error('Too many streams');
+    if (active.size >= 10) throw Error('Too many streams');
     streams.set(user.id, active);
     const entry = { close: () => upstream?.terminate() }; active.add(entry);
     release = () => { active.delete(entry); if (!active.size) streams.delete(user.id); };

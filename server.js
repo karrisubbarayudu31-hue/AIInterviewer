@@ -48,6 +48,22 @@ if (![dailyLimit, dailySpeech].every(n => Number.isInteger(n) && n > 0 && n <= 1
 const tickets = new Map();
 const inFlight = new Set();
 const streams = new Map();
+const speechmaticsStreamUsage = new Map();
+function selectSpeechmaticsKey(rawKeys) {
+  const keys = String(rawKeys || '').split(/[,;|\s]+/).map(k => k.trim()).filter(Boolean);
+  if (!keys.length) return '';
+  if (keys.length === 1) return keys[0];
+  let bestKey = keys[0];
+  let minCount = speechmaticsStreamUsage.get(bestKey) || 0;
+  for (const k of keys) {
+    const count = speechmaticsStreamUsage.get(k) || 0;
+    if (count < minCount) {
+      minCount = count;
+      bestKey = k;
+    }
+  }
+  return bestKey;
+}
 const json = (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }); res.end(JSON.stringify(value)); };
 async function body(req, limit = 6 * 1024 * 1024) {
   let size = 0; const parts = [];
@@ -218,6 +234,7 @@ server.on('upgrade', async (req, socket, head) => {
     streams.set(user.id, active);
     const entry = { close: () => upstream?.terminate() }; active.add(entry);
     release = () => { active.delete(entry); if (!active.size) streams.delete(user.id); };
+    let chosenSpeechmaticsKey;
     if (env.TRANSCRIPTION_PROVIDER === 'deepgram') {
       const language = String(env.DEEPGRAM_LANGUAGE || 'en-IN');
       if (!/^[a-z]{2,3}(?:-[A-Z]{2})?$|^multi$/.test(language)) throw Error('Invalid Deepgram language');
@@ -227,7 +244,11 @@ server.on('upgrade', async (req, socket, head) => {
         endpointing: '300', utterance_end_ms: '800', vad_events: 'true', mip_opt_out: 'true'
       });
       upstream = new WebSocket('wss://api.deepgram.com/v1/listen?' + q, { headers: { Authorization: 'Token ' + env.DEEPGRAM_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
-    } else upstream = new WebSocket(speechmaticsRealtimeUrl, { headers: { Authorization: 'Bearer ' + env.SPEECHMATICS_API_KEY }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
+    } else {
+      chosenSpeechmaticsKey = selectSpeechmaticsKey(env.SPEECHMATICS_API_KEY);
+      speechmaticsStreamUsage.set(chosenSpeechmaticsKey, (speechmaticsStreamUsage.get(chosenSpeechmaticsKey) || 0) + 1);
+      upstream = new WebSocket(speechmaticsRealtimeUrl, { headers: { Authorization: 'Bearer ' + chosenSpeechmaticsKey }, handshakeTimeout: 15000, maxPayload: 1024 * 1024 });
+    }
     wss.handleUpgrade(req, socket, head, downstream => {
       let closed = false;
       let checking = false;
@@ -241,6 +262,9 @@ server.on('upgrade', async (req, socket, head) => {
         if (closed) return;
         closed = true; clearInterval(check); clearTimeout(maxDuration); clearTimeout(connectTimeout);
         pending = []; pendingBytes = 0;
+        if (chosenSpeechmaticsKey) {
+          speechmaticsStreamUsage.set(chosenSpeechmaticsKey, Math.max(0, (speechmaticsStreamUsage.get(chosenSpeechmaticsKey) || 1) - 1));
+        }
         if (downstream.readyState < 2) downstream.close(code, reason);
         if (upstream?.readyState < 2) upstream.terminate();
         release();
